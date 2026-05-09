@@ -34,8 +34,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Large model files (tracked separately or via DVC)
-# *.safetensors
-# *.bin
-# *.pt
-# *.pth
+# Large model files
+*.safetensors
+model.safetensors.index.json
+*.bin
+*.pt
+*.pth
