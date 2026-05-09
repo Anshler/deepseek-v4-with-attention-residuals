@@ -1,26 +1,25 @@
-# Inference code for DeepSeek models
+# DeepSeek-V4-Pro + Attention Residuals
 
-First convert huggingface model weight files to the format of this project.
-```bash
-export EXPERTS=384
-export MP=8
-export CONFIG=config.json
-python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
-```
+A conceptual modification of [DeepSeek V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) that incorporates [MoonShot's Attention Residuals](https://arxiv.org/abs/2603.15031) mechanism.
 
-Then chat with DeepSeek model at will!
-```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --interactive
-```
+**This is not a runnable model — concept only.**
 
-Or batch inference from file.
-```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
-```
+### How it works
 
-Or multi nodes inference.
-```bash
-torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
-```
+1. **Block grouping.** Layers are partitioned into blocks (e.g., `block_size=4` sublayer-units = 2 transformer layers). Within a block, standard residuals accumulate. At block boundaries, the accumulated tensor is promoted to a completed block and the accumulator resets.
 
-If you want to use fp8, just remove `"expert_dtype": "fp4"` in `config.json` and specify `--expert-dtype fp8` in `convert.py`.
+2. **Depth mixing.** Each sublayer (ATTN or FFN) has a learnable pseudo-query vector `[d]` and a key-norm. Given a list of source tensors (completed blocks + current partial block), it computes:
+   ```
+   scores = pseudo_query · RMSNorm(sources) * d^(-0.5)
+   weights = softmax(scores)
+   input = Σ weights_i * source_i
+   ```
+   Pseudo-queries are zero-initialized, giving uniform depth weights at startup.
+
+3. **Two independent mixing patterns.** The attention sublayer and FFN sublayer each have their own pseudo-query + key-norm pair, allowing them to learn different depth-routing strategies (e.g., ATTN prefers recent blocks, FFN draws from earlier semantic representations).
+
+4. **State tracking.** The `Transformer` maintains three pieces of state across layers:
+   - `blocks: list[Tensor]` — completed block representations
+   - `partial_block: Tensor | None` — the currently accumulating block
+   - `counter: int` — sublayer count; triggers promotion when `counter >= block_size`
+
