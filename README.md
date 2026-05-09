@@ -2,7 +2,11 @@
 
 A conceptual modification of [DeepSeek V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) that incorporates [MoonShot's Attention Residuals](https://arxiv.org/abs/2603.15031) mechanism.
 
-**This is not a runnable model — concept only.**
+**This is not a working model — concept only.**
+
+### Inference
+
+Run ```model.py```
 
 ### How it works
 
