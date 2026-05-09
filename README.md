@@ -4,6 +4,8 @@ A conceptual modification of [DeepSeek V4 Pro](https://huggingface.co/deepseek-a
 
 **This is not a working model — concept only.**
 
+[Code change comparison](https://github.com/Anshler/deepseek-v4-with-attention-residuals/commit/be0e8761762735618dcbb4dcce1435bb9115c115)
+
 ### Inference
 
 Run ```model.py```
