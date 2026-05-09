@@ -1,6 +1,6 @@
-# DeepSeek-V4-Pro + Attention Residuals
+# DeepSeek V4 Pro + Attention Residuals
 
-A conceptual modification of [DeepSeek V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) that incorporates [MoonShot's Attention Residuals](https://arxiv.org/abs/2603.15031) mechanism.
+A conceptual modification of [DeepSeek V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) that replaces [mHC](https://arxiv.org/abs/2512.24880) with [Attention Residuals](https://arxiv.org/abs/2603.15031).
 
 **This is not a working model — concept only.**
 
