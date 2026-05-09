@@ -2,13 +2,14 @@ import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
+from contextlib import contextmanager
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn
+from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
 
 
 world_size = 1
@@ -19,6 +20,16 @@ default_dtype = torch.bfloat16
 scale_fmt = None
 scale_dtype = torch.float32
 
+
+@contextmanager
+def set_dtype(dtype):
+    """Temporarily override torch default dtype, restoring it on exit (even if an exception occurs)."""
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
 
 @dataclass
 class ModelArgs:
@@ -63,8 +74,10 @@ class ModelArgs:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 512
-    # block attnres
-    block_size: int = 4  # sublayer-units per block; each ATTN/MLP contributes 2
+    # hc
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
+    hc_eps: float = 1e-6
 
 
 class ParallelEmbedding(nn.Module):
@@ -632,101 +645,94 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block with Block Attention Residuals (AttnRes).
-    Layers are grouped into blocks. Within a block, standard residuals accumulate
-    symmetrically. At block boundaries, the accumulated partial_block is promoted
-    to a completed block and reset. Both sublayers receive the same depth-mixed
-    source list (completed blocks + current partial_block)."""
-
+    """Transformer block with Hyper-Connections (HC) mixing.
+    Instead of a simple residual, HC maintains `hc_mult` copies of the hidden state.
+    hc_pre: reduces hc copies -> 1 via learned weighted sum (pre-weights from Sinkhorn).
+    hc_post: expands 1 -> hc copies via learned post-weights + combination matrix."""
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        self.dim = args.dim
-        self.block_size = args.block_size
         self.attn = Attention(layer_id, args)
         self.ffn = MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
-        # Two independent pseudo-queries + key-norms: one pair per sublayer.
-        # Zero-init → uniform softmax weights at initialization.
-        self.attn_res_proj = nn.Parameter(torch.zeros(args.dim))
-        self.mlp_res_proj = nn.Parameter(torch.zeros(args.dim))
-        self.attn_res_norm = RMSNorm(args.dim, self.norm_eps)
-        self.mlp_res_norm = RMSNorm(args.dim, self.norm_eps)
-        self.depth_scale = args.dim ** -0.5
+        self.hc_mult = hc_mult = args.hc_mult
+        self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
+        self.hc_eps = args.hc_eps
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * args.dim
+        with set_dtype(torch.float32):
+            self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
+            self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
+            self.hc_attn_scale = nn.Parameter(torch.empty(3))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
-    def _depth_mix(self, sources, proj, norm):
-        """Attend over a list of source tensors via depth-wise softmax.
-        Sources is a list of [b, s, d] tensors (completed blocks + partial_block)."""
-        dtype = sources[0].dtype
-        V = torch.stack(sources, dim=2)                   # [b, s, N, d]
-        K = norm(V).float()                               # RMSNorm keys in float32
-        scores = torch.einsum("d,bsnd->bsn", proj.float(), K) * self.depth_scale
-        weights = F.softmax(scores, dim=-1)               # [b, s, N]
-        return torch.einsum("bsn,bsnd->bsd", weights, V.float()).to(dtype)
+    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor],
-                blocks: list, partial_block: Optional[torch.Tensor],
-                counter: int) -> tuple[list, Optional[torch.Tensor], int]:
-        # --- Build sources (same for both sublayers) ---
-        sources = blocks.copy()
-        if partial_block is not None:
-            sources.append(partial_block)
+    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        return y.type_as(x)
 
-        # --- Attention sublayer ---
-        if sources:
-            attn_input = self._depth_mix(sources, self.attn_res_proj, self.attn_res_norm)
-        else:
-            attn_input = x
-        attn_out = self.attn(self.attn_norm(attn_input), start_pos)
-        if partial_block is not None:
-            partial_block = partial_block + attn_out
-        else:
-            partial_block = attn_out
-        counter += 2
+    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x = self.attn_norm(x)
+        x = self.attn(x, start_pos)
+        x = self.hc_post(x, residual, post, comb)
 
-        # --- FFN sublayer ---
-        sources = blocks.copy()
-        if partial_block is not None:
-            sources.append(partial_block)
-        if sources:
-            ffn_input = self._depth_mix(sources, self.mlp_res_proj, self.mlp_res_norm)
-        else:
-            ffn_input = partial_block
-        ffn_out = self.ffn(self.ffn_norm(ffn_input), input_ids)
-        partial_block = partial_block + ffn_out
-        counter += 2
-
-        # --- Block boundary ---
-        if counter >= self.block_size:
-            blocks.append(partial_block)
-            partial_block = None
-            counter = 0
-
-        return blocks, partial_block, counter
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        x = self.hc_post(x, residual, post, comb)
+        return x
 
 
 class ParallelHead(nn.Module):
 
-    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6):
+    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+        self.norm_eps = norm_eps
+        self.hc_eps = hc_eps
         self.part_vocab_size = (vocab_size // world_size)
+        # lm_head in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for easier computation of logits later.
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
     def get_logits(self, x):
         return F.linear(x[:, -1].float(), self.weight)
 
-    def forward(self, x: torch.Tensor):
-        # x: [b, s, d]  — already depth-mixed by AttnRes
-        logits = self.get_logits(x)
+    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+        # x: [b,s,hc,d]
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        logits = self.get_logits(norm(x))
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
         return logits
+
+    def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype)
 
 
 class MTPBlock(Block):
@@ -738,32 +744,31 @@ class MTPBlock(Block):
         self.enorm = RMSNorm(args.dim, args.norm_eps)
         self.hnorm = RMSNorm(args.dim, args.norm_eps)
         self.norm = RMSNorm(args.dim, args.norm_eps)
+        self.hc_mult = hc_mult = args.hc_mult
+        hc_dim = hc_mult * args.dim
+        with set_dtype(torch.float32):
+            self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.empty(1))
         self.embed: ParallelEmbedding = None
         self.head: ParallelHead = None
 
     @torch.inference_mode()
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: torch.Tensor) -> torch.Tensor:
-        # x: [b, s, d]  — main model hidden state (no HC copies)
+        # x: [b,s,hc,d]
         assert self.embed is not None and self.head is not None
         e = self.embed(input_ids)
         e = self.enorm(e)
         x = self.hnorm(x)
-        merged = self.e_proj(e) + self.h_proj(x)
-        # MTP has its own block-tracking context starting from the merged state
-        blocks = []
-        partial_block = merged
-        counter = 0
-        blocks, partial_block, counter = super().forward(
-            merged, start_pos, input_ids, blocks, partial_block, counter)
-        h = partial_block if partial_block is not None else blocks[-1]
-        logits = self.head(self.norm(h))
+        x = self.e_proj(e).unsqueeze(2) + self.h_proj(x)
+        x = super().forward(x, start_pos, input_ids)
+        logits = self.head(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
 
 
 class Transformer(nn.Module):
-    """Full DeepSeek-V4 model with Block Attention Residuals: embed -> N blocks -> logits.
+    """Full DeepSeek-V4 model: embed -> HC-expand -> N blocks -> HC-head -> logits.
     Sets global state (world_size, rank, default_dtype, scale_fmt, scale_dtype) in __init__."""
-
     def __init__(self, args: ModelArgs):
         global world_size, rank, default_dtype, scale_fmt, scale_dtype
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -774,29 +779,33 @@ class Transformer(nn.Module):
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.norm_eps = args.norm_eps
+        self.hc_eps = args.hc_eps
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim, self.norm_eps)
-        self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps)
+        self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps)
         self.mtp = torch.nn.ModuleList()
         for layer_id in range(args.n_mtp_layers):
             self.mtp.append(MTPBlock(args.n_layers + layer_id, args))
             self.mtp[-1].embed = self.embed
             self.mtp[-1].head = self.head
+        self.hc_mult = hc_mult = args.hc_mult
+        hc_dim = hc_mult * args.dim
+        with set_dtype(torch.float32):
+            self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
-        h = self.embed(input_ids)                       # [b, s, d]
-        blocks: list = []
-        partial_block = h                                # embedding = initial partial block
-        counter = 0
+        h = self.embed(input_ids)
+        # Expand to hc_mult copies for Hyper-Connections
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
-            blocks, partial_block, counter = layer(
-                h, start_pos, input_ids, blocks, partial_block, counter)
-            h = partial_block if partial_block is not None else blocks[-1]
-        logits = self.head(self.norm(h))
+            h = layer(h, start_pos, input_ids)
+        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
 
 
@@ -804,32 +813,15 @@ if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    args = ModelArgs(
-        n_hash_layers=0,
-        max_batch_size=1,
-        max_seq_len=256,
-        dim=2048,
-        vocab_size=32000,
-        moe_inter_dim=1024,
-        n_layers=1,
-        n_heads=32,
-        q_lora_rank=512,
-        head_dim=256,
-        rope_head_dim=64,
-        o_groups=4,
-        o_lora_rank=512,
-        n_routed_experts=4,
-        n_activated_experts=2,
-    )
-    x = torch.randint(0, args.vocab_size, (1, 128))
+    args = ModelArgs(n_hash_layers=0)
+    x = torch.randint(0, args.vocab_size, (2, 128))
     model = Transformer(args)
 
     print(model(x).size())
     for i in range(128, 150):
         print(i, model(x[:, 0:1], i).size())
 
-    h = torch.randn(1, 128, args.dim)
+    h = torch.randn(2, 128, args.hc_mult, args.dim)
     mtp = model.mtp[0]
     print(mtp(h, 0, x).size())
     print(mtp(h[:, 0:1], 1, x[:, 0:1]).size())
-
