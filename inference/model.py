@@ -63,10 +63,8 @@ class ModelArgs:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 512
-    # hc
-    hc_mult: int = 4
-    hc_sinkhorn_iters: int = 20
-    hc_eps: float = 1e-6
+    # block attnres
+    block_size: int = 4  # sublayer-units per block; each ATTN/MLP contributes 2
 
 
 class ParallelEmbedding(nn.Module):
@@ -634,15 +632,18 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block with Attention Residuals (AttnRes).
-    Depth mixing happens twice per layer (before attn and before FFN), each with
-    its own learned pseudo-query and key-norm — matching the paper's design."""
+    """Transformer block with Block Attention Residuals (AttnRes).
+    Layers are grouped into blocks. Within a block, standard residuals accumulate
+    symmetrically. At block boundaries, the accumulated partial_block is promoted
+    to a completed block and reset. Both sublayers receive the same depth-mixed
+    source list (completed blocks + current partial_block)."""
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
+        self.block_size = args.block_size
         self.attn = Attention(layer_id, args)
         self.ffn = MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -657,41 +658,53 @@ class Block(nn.Module):
 
     def _depth_mix(self, sources, proj, norm):
         """Attend over a list of source tensors via depth-wise softmax.
-        Sources may be any list of [b, s, d] tensors (previous layer outputs,
-        or layer outputs + current partial state for the MLP step)."""
+        Sources is a list of [b, s, d] tensors (completed blocks + partial_block)."""
+        dtype = sources[0].dtype
         V = torch.stack(sources, dim=2)                   # [b, s, N, d]
-        K = norm(V)                                       # RMSNorm keys
-        scores = torch.einsum("d,bsnd->bsn", proj, K.float()) * self.depth_scale
+        K = norm(V).float()                               # RMSNorm keys in float32
+        scores = torch.einsum("d,bsnd->bsn", proj.float(), K) * self.depth_scale
         weights = F.softmax(scores, dim=-1)               # [b, s, N]
-        return torch.einsum("bsn,bsnd->bsd", weights, V)  # raw values, not normed
+        return torch.einsum("bsn,bsnd->bsd", weights, V.float()).to(dtype)
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor],
-                layer_outputs: list) -> torch.Tensor:
+                blocks: list, partial_block: Optional[torch.Tensor],
+                counter: int) -> tuple[list, Optional[torch.Tensor], int]:
+        # --- Build sources (same for both sublayers) ---
+        sources = blocks.copy()
+        if partial_block is not None:
+            sources.append(partial_block)
+
         # --- Attention sublayer ---
-        # Depth-mix over all previous layer outputs to form the attention input.
-        # x (= hidden_states from previous step) is already layer_outputs[-1].
-        if layer_outputs:
-            attn_input = self._depth_mix(layer_outputs, self.attn_res_proj, self.attn_res_norm)
+        if sources:
+            attn_input = self._depth_mix(sources, self.attn_res_proj, self.attn_res_norm)
         else:
             attn_input = x
-
         attn_out = self.attn(self.attn_norm(attn_input), start_pos)
-        # Full AttnRes: every layer is a block boundary → reset residual,
-        # storing the old state in layer_outputs for future depth mixing.
-        x = attn_out  # fresh residual (paper: partial_block = None then + attn_out)
+        if partial_block is not None:
+            partial_block = partial_block + attn_out
+        else:
+            partial_block = attn_out
+        counter += 2
 
         # --- FFN sublayer ---
-        # Mix over previous layer outputs + the fresh attention state.
-        if layer_outputs:
-            ffn_input = self._depth_mix(layer_outputs + [x], self.mlp_res_proj, self.mlp_res_norm)
+        sources = blocks.copy()
+        if partial_block is not None:
+            sources.append(partial_block)
+        if sources:
+            ffn_input = self._depth_mix(sources, self.mlp_res_proj, self.mlp_res_norm)
         else:
-            ffn_input = x
-
+            ffn_input = partial_block
         ffn_out = self.ffn(self.ffn_norm(ffn_input), input_ids)
-        x = x + ffn_out  # accumulate onto the fresh residual
+        partial_block = partial_block + ffn_out
+        counter += 2
 
-        layer_outputs.append(x)
-        return x
+        # --- Block boundary ---
+        if counter >= self.block_size:
+            blocks.append(partial_block)
+            partial_block = None
+            counter = 0
+
+        return blocks, partial_block, counter
 
 
 class ParallelHead(nn.Module):
@@ -707,7 +720,7 @@ class ParallelHead(nn.Module):
         return F.linear(x[:, -1].float(), self.weight)
 
     def forward(self, x: torch.Tensor):
-        # x: [b, s, d]  — already depth-mixed by AttnRes, no HC reduction needed
+        # x: [b, s, d]  — already depth-mixed by AttnRes
         logits = self.get_logits(x)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
@@ -736,15 +749,19 @@ class MTPBlock(Block):
         e = self.enorm(e)
         x = self.hnorm(x)
         merged = self.e_proj(e) + self.h_proj(x)
-        # MTP has its own depth-wise context starting from the merged state
-        layer_outputs = [merged]
-        h = super().forward(merged, start_pos, input_ids, layer_outputs)
+        # MTP has its own block-tracking context starting from the merged state
+        blocks = []
+        partial_block = merged
+        counter = 0
+        blocks, partial_block, counter = super().forward(
+            merged, start_pos, input_ids, blocks, partial_block, counter)
+        h = partial_block if partial_block is not None else blocks[-1]
         logits = self.head(self.norm(h))
         return logits
 
 
 class Transformer(nn.Module):
-    """Full DeepSeek-V4 model with Attention Residuals: embed -> N blocks -> logits.
+    """Full DeepSeek-V4 model with Block Attention Residuals: embed -> N blocks -> logits.
     Sets global state (world_size, rank, default_dtype, scale_fmt, scale_dtype) in __init__."""
 
     def __init__(self, args: ModelArgs):
@@ -772,9 +789,13 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
         h = self.embed(input_ids)                       # [b, s, d]
-        layer_outputs = [h]                              # token embedding = "layer 0"
+        blocks: list = []
+        partial_block = h                                # embedding = initial partial block
+        counter = 0
         for layer in self.layers:
-            h = layer(h, start_pos, input_ids, layer_outputs)
+            blocks, partial_block, counter = layer(
+                h, start_pos, input_ids, blocks, partial_block, counter)
+            h = partial_block if partial_block is not None else blocks[-1]
         logits = self.head(self.norm(h))
         return logits
 
@@ -783,15 +804,32 @@ if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    args = ModelArgs(n_hash_layers=0)
-    x = torch.randint(0, args.vocab_size, (2, 128))
+    args = ModelArgs(
+        n_hash_layers=0,
+        max_batch_size=1,
+        max_seq_len=256,
+        dim=2048,
+        vocab_size=32000,
+        moe_inter_dim=1024,
+        n_layers=1,
+        n_heads=32,
+        q_lora_rank=512,
+        head_dim=256,
+        rope_head_dim=64,
+        o_groups=4,
+        o_lora_rank=512,
+        n_routed_experts=4,
+        n_activated_experts=2,
+    )
+    x = torch.randint(0, args.vocab_size, (1, 128))
     model = Transformer(args)
 
     print(model(x).size())
     for i in range(128, 150):
         print(i, model(x[:, 0:1], i).size())
 
-    h = torch.randn(2, 128, args.dim)
+    h = torch.randn(1, 128, args.dim)
     mtp = model.mtp[0]
     print(mtp(h, 0, x).size())
     print(mtp(h[:, 0:1], 1, x[:, 0:1]).size())
+

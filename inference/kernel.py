@@ -37,7 +37,7 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def act_quant_kernel(
     N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32,
     round_scale=False, inplace=False
@@ -125,7 +125,7 @@ def act_quant(
     return y, s
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def fp4_quant_kernel(
     N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False
 ):
@@ -200,7 +200,7 @@ def fp4_act_quant(
     return y, s
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def fp8_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
     assert out_dtype in [BF16, FP32]
 
@@ -273,7 +273,7 @@ def fp8_gemm(
     return c
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def sparse_attn_kernel(h: int, d: int, scale=None):
     """Sparse multi-head attention via index gathering + online softmax (FlashAttention-style).
     For each (batch, seq_pos), gathers top-k KV positions by index, computes attention
@@ -368,7 +368,7 @@ def sparse_attn(
     return o
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     n = T.symbolic("n")
     mix_hc = (2 + hc) * hc
@@ -438,7 +438,7 @@ def hc_split_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torc
     return pre, post, comb
 
 
-@tilelang.jit(pass_configs=pass_configs)
+@tilelang.jit(pass_configs=pass_configs, compile_flags="-D__NO_MATH_INLINES")
 def fp4_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
     """FP8 act x FP4 weight GEMM kernel.
 
